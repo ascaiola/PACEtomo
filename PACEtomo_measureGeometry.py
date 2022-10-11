@@ -26,7 +26,7 @@ sem.MoveToNavItem(int(firstPoint[0]))
 points = [[], [], []]
 for i in range(int(firstPoint[0]), int(firstPoint[0] + groupPoints)):
 	point = sem.ReportOtherItem(i)
-	coords = [-point[1] + firstPoint[1], -point[2] + firstPoint[2]]
+	coords = [point[1] - firstPoint[1], point[2] - firstPoint[2]]
 	sem.ImageShiftByMicrons(coords[0], coords[1])
 	sem.G(-1)
 	(d, error) = sem.ReportAutoFocus()
