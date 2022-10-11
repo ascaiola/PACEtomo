@@ -44,7 +44,7 @@ if not targetPattern and not targetByShift and groupInfo[1] > 0:
 		coordsRefine.append([0, 0])
 		for i in range(int(firstPoint[0]) + 1, int(firstPoint[0] + groupPoints)):
 			point = sem.ReportOtherItem(i)
-			coordsRefine.append([point[1] - firstPoint[1], point[2] - firstPoint[2]])
+			coordsRefine.append([point[1] - firstPoint[1], -point[2] + firstPoint[2]])
 
 sem.UserSetDirectory("Please choose a directory for saving targets and tilt series!")
 
