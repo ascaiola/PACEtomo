@@ -54,7 +54,7 @@ print("Normal vector: " + str(norm))
 #Florian :
 #tilty = -np.degrees(np.arctan(np.sqrt(norm[0:2].dot(norm[0:2]))))
 #Alain :
-titly = np.degrees(np.arctan2(np.sqrt((norm[0]*norm[0])+(norm[1]*norm[1])),np.abs(norm[2])))
+tilty = np.degrees(np.arctan2(np.sqrt((norm[0]*norm[0])+(norm[1]*norm[1])),np.abs(norm[2])))
 print("Estimated pretilt: " + str(round(tilty, 1)) + " degrees")
 
 rotation = -np.degrees(np.arctan(norm[0]/norm[1]))
