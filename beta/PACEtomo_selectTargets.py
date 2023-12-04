@@ -5,9 +5,8 @@
 #		More information at http://github.com/eisfabian/PACEtomo
 # Author:	Fabian Eisenstein
 # Created:	2021/04/19
-# Revision:	v1.5.1
-# Last Change:	2023/04/27: fixed realign to tracking target
-#		2022/09/27: bug fixes after Krios testing
+# Revision:	v1.6.1
+# Last Change:	2023/05/08: fixed preTilt sign fix
 # ===================================================================
 
 ############ SETTINGS ############ 
@@ -25,9 +24,11 @@ beamDiameter 	= 0 		# beam diameter [microns] (if 0, ReportIlluminatedArea will 
 maxTilt 	= 60		# tilt angle [degrees] to calculate stretching of beam perpendicular to tilt axis
 
 # Advanced settings
+sampleName	= ""		# optional prefix for all files created
 useSearch 	= False		# use Search mode instead of View mode to find targets by dragging
 vecA		= (0, 0)	# vectors for grid pattern [microns specimen shift] are determined automatically...
 vecB		= (0, 0)	# ...only change if you want to setup pattern without alignToP reference
+patternRot	= 0 		# rotation of pattern grid relative to tilt axis (used for filling a polygon with points)
 
 ########## END SETTINGS ########## 
 
@@ -38,9 +39,12 @@ import glob
 import numpy as np
 import scipy as sp
 import scipy.optimize
+from scipy.signal import fftconvolve
 import tkinter as tk
+from tkinter import ttk
 import matplotlib.pyplot as plt
 import matplotlib.lines
+import matplotlib.path
 from matplotlib.backend_bases import MouseButton
 from matplotlib.backends.backend_tkagg import (FigureCanvasTkAgg, NavigationToolbar2Tk)
 
@@ -114,7 +118,7 @@ def writeTargets(targetFile, targets, savedRun=False, resume={"sec": 0, "pos": 0
 		f.write(output)
 
 def saveNewTarget(targetFile, targetNo, target):
-	if targetPattern:
+	if targetPattern and usePolygon != 1:
 		if targetNo == 1:
 			mapIndex = int(sem.AddStagePosAsNavPoint(target["stageX"], target["stageY"], stageZ))
 			sem.ChangeItemNote(mapIndex, userName + "_tgts.txt")
@@ -142,6 +146,34 @@ def saveNewTarget(targetFile, targetNo, target):
 	with open(targetFile, "a") as f:
 		f.write(output)
 	sem.Echo("Target " + str(targetNo).zfill(3) + " (" + userName + "_tgt_" + str(targetNo).zfill(3) + ".mrc) with image shifts " + str(round(target["SSX"], 3)) + ", " + str(round(target["SSY"], 3)) + " was added.")
+
+def parseNav(navFile):
+	with open(navFile) as f:
+		navContent = f.readlines()
+	header = []
+	items = []
+	newItem = {}
+	index = 0
+
+	for line in navContent:
+		col = line.rstrip().split(" ")
+		if col[0] == "": 
+			if "Item" in newItem.keys():
+				items.append(newItem)
+				newItem = {}
+				continue
+			else:
+				continue
+		if line.startswith("[Item"):
+			index += 1
+			newItem = {"index": index, "Item": col[2].strip("]")}
+		elif "Item" in newItem.keys():
+			newItem[col[0]] = [val for val in col[2:]]
+		else:
+			header.append(line)
+	if "Item" in newItem.keys():	#append last target
+		items.append(newItem)
+	return header, items
 
 def drag():
 	global userInput, targetNo
@@ -195,13 +227,13 @@ def loopAddTargets():
 		userSkip = 1											# initialize as 1 to not apply shifts in case of redo
 		while userInput == 0:
 			if targetByShift or (pointRefine == 1 and userSkip == 1):
-				sem.GoToLowDoseArea("R")
 				if targetByShift:
+					sem.GoToLowDoseArea("R")
 					shiftx = sem.EnterDefaultedNumber(0, 1, "Enter X shift:")
 					shifty = sem.EnterDefaultedNumber(0, 1, "Enter Y shift:")
 				else:
 					sem.SetImageShift(0, 0)							# use 0,0 instead of ISX0,ISY0 to account for user shift of first target away from point
-					shiftx, shifty = coordsRefine[pointNo][0], coordsRefine[pointNo][1]
+					shiftx, shifty = coordsRefine[pointNo]
 				sem.ImageShiftByMicrons(shiftx, shifty)
 			if useSearch: 
 				sem.Search()
@@ -213,7 +245,7 @@ def loopAddTargets():
 					userSkip = sem.YesNoBox("\n".join(["SKIP?", "", "Do you want to skip this point of the group?"]))
 					if userSkip == 1:
 						pointNo += 1
-						if pointNo >= groupPoints:					# disable pointRefine when last point of a group is skipped
+						if pointNo >= len(coordsRefine):				# disable pointRefine when last point of a group is skipped
 							pointRefine = 0
 							addTargets = sem.YesNoBox("All points of the selected group have been viewed. Do you want to add another target manually?")
 				else:
@@ -246,9 +278,9 @@ def loopAddTargets():
 		saveNewTarget(tgtsFilePath, targetNo, target)
 
 		if drawBeam:
-			polygons.append(drawBeamPolygon(target["stageX"], target["stageY"], stageZ, beamR, maxTilt))
+			beamPolygons.append(drawBeamPolygon(target["stageX"], target["stageY"], stageZ, beamR, maxTilt))
 
-		if pointRefine == 1 and pointNo >= groupPoints:
+		if pointRefine == 1 and pointNo >= len(coordsRefine):
 			addTargets = sem.YesNoBox("All points of the selected group have been viewed. Do you want to add another target manually?")
 			pointRefine = 0
 		else:
@@ -289,6 +321,116 @@ def drawBeamPolygon(stageX, stageY, stageZ, radius, angle):
 	sem.ChangeItemColor(polyID, 3)
 
 	return polyID
+
+##########
+# Source: https://github.com/Sabrewarrior/normxcorr2-python/blob/master/normxcorr2.py
+def autoXcorr(image):
+	image = image - np.mean(image)
+	corr = fftconvolve(image, image[::-1, ::-1], mode="same")
+	corr = corr / np.sum(np.square(image))
+	return corr
+##########
+
+def vecByXcorr(diameter):
+	# devSettings
+	updatePlot 	= False		# show plot after finding each peak
+	maxBinning 	= 10		# maximum binning of input image (depends on pixel size and diameter)
+	pixPerHole 	= 20		# desired amount of pixels per hole diameter
+	searchRangeFac	= 2 		# how many times the radius should be excluded around a found peak
+	cropRangeFac 	= 5		# how many times should the searched image contain the search range
+	maxPeaks 	= 6		# how many peaks should be searched
+	accuracy 	= 0.1 		# dot product and normalized vector length difference needs to be less for vectors to be accepted
+
+	buffer, *_ = sem.ReportCurrentBuffer()
+
+	imgProp = sem.ImageProperties(buffer)
+	pixSize = imgProp[4]
+	binning = min(max(1, np.floor(1000 * diameter / pixPerHole / pixSize)), maxBinning)
+
+	if binning > 1:
+		sem.ReduceImage(buffer, binning)
+		buffer = "A"
+		imgProp = sem.ImageProperties(buffer)
+		pixSize = imgProp[4]
+	x = imgProp[0]
+	y = imgProp[1]
+
+	searchRadius = int(diameter * 1000 / pixSize / 2 * searchRangeFac)
+	image = np.asarray(sem.bufferImage(buffer))
+
+	imgStartX = int(max(0, x / 2 - cropRangeFac * searchRadius))
+	imgStartY = int(max(0, y / 2 - cropRangeFac * searchRadius))
+	image = image[imgStartX:(imgStartX + 2 * cropRangeFac * searchRadius), imgStartY:(imgStartY + 2 * cropRangeFac * searchRadius)] 
+
+	output = autoXcorr(image)
+	outsq = np.square(output)
+
+	peaks = []
+	while len(peaks) < maxPeaks:
+		peaks.append(np.unravel_index(np.argmax(outsq), outsq.shape))
+		rangeStartX = max(0, peaks[-1][0] - searchRadius)
+		rangeStartY = max(0, peaks[-1][1] - searchRadius)
+		outsq[rangeStartX:(rangeStartX + 2 * searchRadius), rangeStartY:(rangeStartY + 2 * searchRadius)] = np.zeros(outsq[rangeStartX:(rangeStartX + 2 * searchRadius), rangeStartY:(rangeStartY + 2 * searchRadius)].shape)
+		if updatePlot:
+			imgplot = plt.imshow(outsq)
+			plt.show()
+
+	peaks = np.array(peaks) + np.array([imgStartX, imgStartY])
+	success = False
+
+	ptID0 = int(sem.AddImagePosAsNavPoint(buffer, peaks[0][1], peaks[0][0], 0))
+
+	vecA = np.zeros(2)
+	i = 0
+	while np.linalg.norm(vecA) < 2 * searchRadius:
+		i += 1
+		if i >= len(peaks):
+			 sem.Echo("WARNING: Failed to find appropiately sized vector!")
+			 sem.DeleteNavigatorItem(int(ptID0))
+			 return success, np.zeros(2), np.zeros(2)
+		vecA = peaks[i] - peaks[0]
+
+	shortest = 1
+	for i in range(1, len(peaks)):
+		vecB = peaks[i] - peaks[0]
+		if np.linalg.norm(vecB) < np.linalg.norm(vecA) and np.linalg.norm(vecB) > 2 * searchRadius:
+			vecA = vecB
+			shortest = i
+
+	ptID1 = int(sem.AddImagePosAsNavPoint(buffer, peaks[shortest][1], peaks[shortest][0], 0))
+
+	for i in range(1, len(peaks)):
+		vecB = peaks[i] - peaks[0]
+		dotprod = vecA.dot(vecB) / vecA.dot(vecA)
+		if abs(dotprod) < accuracy and abs(np.linalg.norm(vecA) - np.linalg.norm(vecB)) / np.linalg.norm(vecA) < accuracy:
+			ptID2 = int(sem.AddImagePosAsNavPoint(buffer, peaks[i][1], peaks[i][0], 0))
+			success = True
+			break
+
+	if not success:
+		sem.Echo("WARNING: Failed to find orthogonal vectors for pattern!")
+	else:
+		ptID0, x0, y0, *_ = sem.ReportOtherItem(ptID0)
+		ptID1, x1, y1, *_ = sem.ReportOtherItem(ptID1)
+		ptID2, x2, y2, *_ = sem.ReportOtherItem(ptID2)
+
+		vecA = np.around((-x1 + x0, -y1 + y0), 3)
+		vecB = np.around((-x2 + x0, -y2 + y0), 3)
+		if np.linalg.norm(vecA) > diameter:
+			if vecA[1] < 0: vecA = -vecA								# make vectors face towards y > 0
+			if vecB[1] < 0: vecB = -vecB
+			sem.Echo("NOTE: Orthogonal vectors for pattern were found!")
+		else:
+			sem.Echo("WARNING: Failed to find appropiately sized vectors for pattern!")
+			success = False
+	sem.DeleteNavigatorItem(int(ptID2))
+	sem.DeleteNavigatorItem(int(ptID1))
+	sem.DeleteNavigatorItem(int(ptID0))
+
+	if vecB[1] > vecA[1]:											# ensure vecA has larger off tilt axis shift
+		return success, vecB, vecA
+	else:
+		return success, vecA, vecB
 
 def gui(targetFile):
 	##########
@@ -333,8 +475,8 @@ def gui(targetFile):
 			self.tw = tk.Toplevel(self.widget)							# creates a toplevel window
 			self.tw.wm_overrideredirect(True)							# leaves only the label and removes the app window
 			self.tw.wm_geometry("+%d+%d" % (x, y))
-			label = tk.Label(self.tw, text=self.text, justify='left', background='#ffffff', relief='solid', borderwidth=1, font=("Courier","10"))
-			label.pack(ipadx=1)
+			labelTT = tk.Label(self.tw, text=self.text, justify='left', background='#ffffff', relief='solid', borderwidth=1, font=("Courier","10"))
+			labelTT.pack(ipadx=1)
 
 		def close(self, event=None):
 			if self.tw:
@@ -371,7 +513,7 @@ def gui(targetFile):
 		if geoPoints != []:
 			plt.scatter(geoXval, geoYval, marker="o", color="#fab182", s=100, picker=False)
 		plt.margins(0.25, 0.25)
-		plt.axis('equal')
+		plt.axis("equal")
 		if showBeam:											# plot circles with plot size in microns (beamdiameter)
 			xsize = abs(plt.gca().get_window_extent().width / (plt.gca().get_xlim()[1] - plt.gca().get_xlim()[0]))
 			ysize = abs(plt.gca().get_window_extent().height / (plt.gca().get_ylim()[1] - plt.gca().get_ylim()[0]))
@@ -409,16 +551,7 @@ def gui(targetFile):
 		label = event.artist.get_label()
 		if label == "targets":
 			if button is MouseButton.RIGHT:								# right click to skip target
-				if ind != 0:
-					targets[ind]["skip"] = not targets[ind]["skip"]
-				updateList()
-				listbox.selection_set(ind)
-				listbox.see(ind)
-
-				plt.clf()
-				plotTargets()
-				fig.canvas.draw()
-				fig.canvas.flush_events()
+				skip(ind)
 
 			if button is MouseButton.LEFT:								# left click to select target in list
 				listbox.selection_clear(0, tk.END)
@@ -441,22 +574,33 @@ def gui(targetFile):
 			plt.clf()
 			plotTargets()
 			fig.canvas.draw()
-			fig.canvas.flush_events()
 
-	def openTgt(box=True):												# open preview map with default application
+	def onScroll(event):											# scroll in plot to zoom
+		button = event.button
+		xlim = plt.gca().get_xlim()
+		ylim = plt.gca().get_ylim()
+		if button == "up":
+			scale_factor = 1 / 1.2
+		else:
+			scale_factor = 1.2
+		plt.gca().set_xlim([xlim[0] * scale_factor, xlim[1] * scale_factor])
+		plt.gca().set_ylim([ylim[0] * scale_factor, ylim[1] * scale_factor])
+		fig.canvas.draw()
+
+	def openTgt(box=True):											# open preview map with default application
 		ind = listbox.curselection()[0]
 		if targets[ind]["tgtfile"]:
-			os.system("start " + targets[ind]["tgtfile"])
+			os.system("start " + os.path.join(curDir, targets[ind]["tgtfile"]))
 			return True
 		else:
 			if box:
 				tk.messagebox.showwarning(title="File not found", message="Target file was not found!")
 			return False
 
-	def openTs(box=True):												# open tilt series if it exists
+	def openTs(box=True):											# open tilt series if it exists
 		ind = listbox.curselection()[0]
 		if targets[ind]["tsfile"]:
-			os.system("start " + targets[ind]["tsfile"])
+			os.system("start " + os.path.join(curDir, targets[ind]["tsfile"]))
 			return True
 		else:
 			if box:
@@ -520,9 +664,14 @@ def gui(targetFile):
 			plotTargets()
 			fig.canvas.draw()
 
-	def skip():												# skip selected target
-		ind = listbox.curselection()[0]	
+	def skip(ind=None):											# skip selected target
+		if ind == None:
+			ind = listbox.curselection()[0]	
 		if ind != 0:
+			if savedRun:
+				if savedRun[ind][0]["skip"] == "True" and savedRun[ind][1]["skip"] == "True":
+					sem.Echo("WARNING: Targets previously skipped during acquisition cannot be unskipped!")
+					return
 			targets[ind]["skip"] = not targets[ind]["skip"]
 			updateList()
 			listbox.selection_set(ind)
@@ -530,9 +679,14 @@ def gui(targetFile):
 			plt.clf()
 			plotTargets()
 			fig.canvas.draw()
+		else:
+			sem.Echo("WARNING: Tracking target cannot be skipped!")
 
 	def loadMap():
-		mapLabel = tk.simpledialog.askstring("Map Label", "\n".join(["Please enter the navigator label", "of the map you want to load!"]))
+		global mapLabel
+		if "mapLabel" not in globals():
+			mapLabel = ""
+		mapLabel = tk.simpledialog.askstring("Map Label", "\n".join(["Please enter the navigator label", "of the map you want to load!"]), initialvalue=mapLabel)
 		mapIndex = int(sem.NavIndexWithLabel(mapLabel))
 		if mapIndex == 0:
 			tk.messagebox.showwarning(title="Map not found", message="Map with label '" + mapLabel + "' was not found!")
@@ -560,7 +714,7 @@ def gui(targetFile):
 		closeGUI()
 		realignTrack()
 		if drawBeam:											# make beam polygons visible
-			for polyID in polygons:
+			for polyID in beamPolygons:
 				sem.ChangeItemDraw(polyID, 1)
 		sem.Echo("Adding targets...")		
 		userInput = 0
@@ -571,6 +725,16 @@ def gui(targetFile):
 		return
 
 	def saveViews():
+		btnSaveViews.grid_forget()									# replace view button with progress bar
+		progressBar.grid(column=1, row=4, sticky=tk.W, pady=6)
+		disabledWidgets = [btnSave, btnReset, btnMakeTrack, btnLoadMap, btnAddTargets, btnReorder, btnMeasureGeometry]
+		keepDisabled = []
+		for widget in disabledWidgets:									# disable buttons that could interfere with measure geometry
+			if widget["state"] == tk.DISABLED:							# keep already disabled buttons disabled
+				keepDisabled.append(widget)
+			else:
+				widget["state"] = tk.DISABLED
+
 		realignTrack(rough=True)
 		sem.GoToLowDoseArea("R")
 		for i in range(len(targets)):
@@ -588,9 +752,16 @@ def gui(targetFile):
 				sem.CloseFile()
 			else:
 				sem.LoadOtherMap(viewIndex)
+			targets[i]["viewfile"] = viewName
 			sem.SnapshotToFile(0, 0, "0", "JPG", "JPG", viewName.rsplit(".mrc", 1)[0] + ".jpg")
 			sem.GoToLowDoseArea("R")
 			sem.SetImageShift(ISX0, ISY0)
+			progressBar["value"] = (i + 1) / len(targets)						# update progress bar
+			top.update()
+		progressBar.grid_forget()									# restore button
+		btnSaveViews.grid(column=1, row=4, sticky=tk.W, pady=3)
+		for widget in [item for item in disabledWidgets if item not in keepDisabled]:			# reenable interfering buttons
+			widget["state"] = tk.NORMAL
 
 	def copyAcq():												# find nav points set to acquire and replace Note with tgts file
 		copied = 0
@@ -620,7 +791,9 @@ def gui(targetFile):
 				if "tsfile" in targetsTemp[i].keys():
 					targetsTemp[i]["tsfile"] = userName + "_p" + str(copied).zfill(2) + "_ts_" + str(i + 1).zfill(3) + ".mrc"
 				if i > 0:									# if not tracking tgt, add tgt nav point
-					ptIndex = int(sem.AddStagePosAsNavPoint(targetsTemp[0]["stageX"] - targetsTemp[i]["SSX"], targetsTemp[0]["stageY"] - targetsTemp[i]["SSY"], item[3], groupIndex))
+					stageShift = ss2sMatrix @ np.array([targetsTemp[i]["SSX"], targetsTemp[i]["SSY"]])
+					ptIndex = int(sem.AddStagePosAsNavPoint(targetsTemp[0]["stageX"] + stageShift[0], targetsTemp[0]["stageY"] + stageShift[1], item[3], groupIndex))
+					#ptIndex = int(sem.AddStagePosAsNavPoint(targetsTemp[0]["stageX"] + ss2sMatrix[0] * targetsTemp[i]["SSX"], targetsTemp[0]["stageY"] + ss2sMatrix[3] * targetsTemp[i]["SSY"], item[3], groupIndex))
 					sem.ChangeItemLabel(ptIndex, str(i + 1).zfill(3))
 			writeTargets(targetFileCopy, targetsTemp, settings=settings)				# write new tgts file for each stage position
 		tk.messagebox.showinfo(title="Target file copied", message="The targets file was copied to " + str(copied) + " navigator points!")
@@ -679,6 +852,16 @@ def gui(targetFile):
 		if len(geoPoints) < 3:
 			tk.messagebox.showwarning(title="Not enough points", message="\n".join(["You need at least 3 points to measure the geometry!","","Add points by middle clicking in the plot. Points should not be on targets, dark areas or holes."]))
 		else:
+			btnMeasureGeometry.grid_forget()							# replace button with progress bar
+			progressBar.grid(column=3, row=5, sticky=tk.E, pady=6, padx=5)
+			disabledWidgets = [btnSave, btnReset, btnResetGeoPts, btnMakeTrack, btnSaveViews, btnLoadMap, btnAddTargets]
+			keepDisabled = []
+			for widget in disabledWidgets:								# disable buttons that could interfere with measure geometry
+				if widget["state"] == tk.DISABLED:						# keep already disabled buttons disabled
+					keepDisabled.append(widget)
+				else:
+					widget["state"] = tk.DISABLED
+
 			sem.SetImageShift(0,0)
 			realignTrack(rough=True)
 			sem.Echo("Measuring geometry...")
@@ -692,6 +875,8 @@ def gui(targetFile):
 					geoXYZ[1].append(geoPoints[i][1])
 					geoXYZ[2].append(defocus)
 				sem.SetImageShift(0,0)
+				progressBar["value"] = (i + 1) / len(geoPoints)				# update progress bar
+				top.update()
 			##########
 			# Source: https://math.stackexchange.com/q/99317
 			# subtract out the centroid and take the SVD, extract the left singular vectors, the corresponding left singular vector is the normal vector of the best-fitting plane
@@ -701,7 +886,8 @@ def gui(targetFile):
 			##########		
 			sem.Echo("Fitted plane into cloud of " + str(len(geoPoints)) + " points.")
 			sem.Echo("Normal vector: " + str(norm))
-			tilty = -np.degrees(np.arctan(np.linalg.norm(norm[0:2])))
+			sign = 1 if norm[1] <= 0 else -1
+			tilty = sign * np.degrees(np.arccos(norm[2]))
 			sem.Echo("Estimated pretilt: " + str(round(tilty, 1)) + " degrees")
 			rotation = -np.degrees(np.arctan(norm[0]/norm[1]))
 			sem.Echo("Estimated rotation: " + str(round(rotation, 1)) + " degrees")
@@ -711,6 +897,10 @@ def gui(targetFile):
 			entryRotation.delete(0, tk.END)
 			entryRotation.insert(0, str(round(rotation, 1)))
 			readEntry()
+			progressBar.grid_forget()								# restore button
+			btnMeasureGeometry.grid(column=3, row=5, sticky=tk.E, pady=3, padx=5)
+			for widget in [item for item in disabledWidgets if item not in keepDisabled]:		# reenable interfering buttons
+				widget["state"] = tk.NORMAL
 
 	def toggleBeam():
 		nonlocal showBeam
@@ -719,7 +909,7 @@ def gui(targetFile):
 		plotTargets()
 		fig.canvas.draw()
 		if drawBeam:											# also toggle beam polygons in SerialEM
-			for polyID in polygons:
+			for polyID in beamPolygons:
 				sem.ChangeItemDraw(polyID)
 
 	def swapAxes():
@@ -764,24 +954,24 @@ def gui(targetFile):
 
 	showBeam = False
 	if drawBeam:												# draw beam polygons but keep invisible until toggled
-		if polygons == []:
+		if beamPolygons == []:
 			for i in range(len(targets)):
 				if "stageX" in targets[i].keys():
-					polygons.append(drawBeamPolygon(targets[i]["stageX"], targets[i]["stageY"], 0, beamR, maxTilt))
-					sem.ChangeItemDraw(polygons[-1], 0)
+					beamPolygons.append(drawBeamPolygon(targets[i]["stageX"], targets[i]["stageY"], 0, beamR, maxTilt))
+					sem.ChangeItemDraw(beamPolygons[-1], 0)
 		else:
-			for polyID in polygons:
+			for polyID in beamPolygons:
 				sem.ChangeItemDraw(polyID, 0)
 
-	cMatrix = sem.SpecimenToCameraMatrix(0)									# figure out axis of plot to match SerialEM view
-	if(abs(cMatrix[0]) > abs(cMatrix[1])):
+	s2cMatrix = sem.SpecimenToCameraMatrix(0)									# figure out axis of plot to match SerialEM view
+	if(abs(s2cMatrix[0]) > abs(s2cMatrix[1])):
 		swapXY = False
-		invX = True if cMatrix[0] < 0 else False
-		invY = True if cMatrix[3] < 0 else False		
+		invX = True if s2cMatrix[0] < 0 else False
+		invY = True if s2cMatrix[3] < 0 else False		
 	else:
 		swapXY = True
-		invX = True if cMatrix[1] < 0 else False
-		invY = True if cMatrix[2] < 0 else False
+		invX = True if s2cMatrix[1] < 0 else False
+		invY = True if s2cMatrix[2] < 0 else False
 
 	# create a root window.
 	top = tk.Tk()
@@ -793,8 +983,8 @@ def gui(targetFile):
 
 	# create target list
 	fileNameLen = max(len(str(targets[0]["tgtfile"])), len(str(targets[0]["tsfile"])))
-	label = tk.Label(top, text=" ".join(["Tgt".ljust(5), "Tgtfile".ljust(fileNameLen + 2), "TSfile".ljust(fileNameLen + 1), "SSX".rjust(6), "SSY".rjust(6), "Skip".ljust(70 - 24 - 2 * fileNameLen)])) 
-	label.grid(column=0, row=0, sticky=tk.E)
+	labelList = tk.Label(top, text=" ".join(["Tgt".ljust(5), "Tgtfile".ljust(fileNameLen + 2), "TSfile".ljust(fileNameLen + 1), "SSX".rjust(6), "SSY".rjust(6), "Skip".ljust(70 - 24 - 2 * fileNameLen)])) 
+	labelList.grid(column=0, row=0, sticky=tk.E)
 
 	listbox = DragDropListbox(top, height=10, selectmode="SINGLE", width=70, activestyle='dotbox')
 	updateList()
@@ -804,66 +994,69 @@ def gui(targetFile):
 	btnWidth = 150
 	btnHeight = 20
 	
-	tgtbutton = tk.Button(top, text="Open Tgtfile", image=pixel, compound="center", height=btnHeight, width=btnWidth, command=openTgt)
-	tgtbutton.grid(column=1, row=1, sticky=tk.W, pady=0)
-	CreateToolTip(tgtbutton, "Opens .mrc file of selected target preview image.")
+	btnOpenTgtfile = tk.Button(top, text="Open Tgtfile", image=pixel, compound="center", height=btnHeight, width=btnWidth, command=openTgt)
+	btnOpenTgtfile.grid(column=1, row=1, sticky=tk.W, pady=0)
+	CreateToolTip(btnOpenTgtfile, "Opens .mrc file of selected target preview image.")
 
-	tsbutton = tk.Button(top, text="Open TSfile", image=pixel, compound="center", height=btnHeight, width=btnWidth, command=openTs)
-	tsbutton.grid(column=2, row=1, sticky=tk.W, pady=0, padx=5)
-	CreateToolTip(tsbutton, "Opens .mrc tilt series stack file of selected target.")
+	btnOpenTSfile = tk.Button(top, text="Open TSfile", image=pixel, compound="center", height=btnHeight, width=btnWidth, command=openTs)
+	btnOpenTSfile.grid(column=2, row=1, sticky=tk.W, pady=0, padx=5)
+	CreateToolTip(btnOpenTSfile, "Opens .mrc tilt series stack file of selected target.")
 
-	skipbutton = tk.Button(top, text="Skip", image=pixel, compound="center", height=btnHeight, width=btnWidth, command=skip)
-	skipbutton.grid(column=1, row=2, sticky=tk.W, pady=3)
-	CreateToolTip(skipbutton, "Toggles skipping of selected target during collection.")
+	btnSkip = tk.Button(top, text="Skip", image=pixel, compound="center", height=btnHeight, width=btnWidth, command=skip)
+	btnSkip.grid(column=1, row=2, sticky=tk.W, pady=3)
+	CreateToolTip(btnSkip, "Toggles skipping of selected target during collection.")
 
-	mtbuttonBorder = tk.Frame(top, highlightbackground="#ffd700", highlightthickness=2)		
-	mtbutton = tk.Button(mtbuttonBorder, text="Make Track", image=pixel, compound="center", height=btnHeight, width=btnWidth, command=makeTrack)
-	if savedRun: mtbutton["state"] = tk.DISABLED
-	mtbutton.pack()
-	mtbuttonBorder.grid(column=2, row=2, sticky=tk.W, pady=3, padx=5)
-	CreateToolTip(mtbutton, "\n".join(["Makes selected target the tracking target.", "This will cause additional exposures on the selected target for realignment."]))
+	btnBorderMakeTrack = tk.Frame(top, highlightbackground="#ffd700", highlightthickness=2)		
+	btnMakeTrack = tk.Button(btnBorderMakeTrack, text="Make Track", image=pixel, compound="center", height=btnHeight, width=btnWidth, command=makeTrack)
+	if savedRun: btnMakeTrack["state"] = tk.DISABLED
+	btnMakeTrack.pack()
+	btnBorderMakeTrack.grid(column=2, row=2, sticky=tk.W, pady=3, padx=5)
+	CreateToolTip(btnMakeTrack, "\n".join(["Makes selected target the tracking target.", "This will cause additional exposures on the selected target for realignment."]))
 
-	lmapbutton = tk.Button(top, text="Load Map", image=pixel, compound="center", height=btnHeight, width=btnWidth, command=loadMap)
-	lmapbutton.grid(column=1, row=3, sticky=tk.W, pady=0)
-	CreateToolTip(lmapbutton, "Loads map into SerialEM for cross referencing.")
+	btnLoadMap = tk.Button(top, text="Load Map", image=pixel, compound="center", height=btnHeight, width=btnWidth, command=loadMap)
+	btnLoadMap.grid(column=1, row=3, sticky=tk.W, pady=0)
+	CreateToolTip(btnLoadMap, "Loads map into SerialEM for cross referencing.")
 
-	addbuttonBorder = tk.Frame(top, highlightbackground="#ffd700", highlightthickness=2)
-	addbutton = tk.Button(addbuttonBorder, text="Add Targets", image=pixel, compound="center", height=btnHeight, width=btnWidth, command=moreTargets)
-	if savedRun: addbutton["state"] = tk.DISABLED
-	addbutton.pack()
-	addbuttonBorder.grid(column=2, row=3, sticky=tk.W, pady=0, padx=5)
-	CreateToolTip(addbutton, "\n".join(["Continues the target selection process.", "This might cause additional exposures on the tracking target for realignment."]))
+	btnBorderAddTargets = tk.Frame(top, highlightbackground="#ffd700", highlightthickness=2)
+	btnAddTargets = tk.Button(btnBorderAddTargets, text="Add Targets", image=pixel, compound="center", height=btnHeight, width=btnWidth, command=moreTargets)
+	if savedRun: btnAddTargets["state"] = tk.DISABLED
+	btnAddTargets.pack()
+	btnBorderAddTargets.grid(column=2, row=3, sticky=tk.W, pady=0, padx=5)
+	CreateToolTip(btnAddTargets, "\n".join(["Continues the target selection process.", "This might cause additional exposures on the tracking target for realignment."]))
 
-	viewbutton = tk.Button(top, text="Save Views", image=pixel, compound="center", height=btnHeight, width=btnWidth, command=saveViews)
-	viewbutton.grid(column=1, row=4, sticky=tk.W, pady=3)
-	CreateToolTip(viewbutton, "Takes and saves view image for each target.")
+	btnSaveViews = tk.Button(top, text="Save Views", image=pixel, compound="center", height=btnHeight, width=btnWidth, command=saveViews)
+	btnSaveViews.grid(column=1, row=4, sticky=tk.W, pady=3)
+	CreateToolTip(btnSaveViews, "Takes and saves view image for each target.")
 
 	#xbutton = tk.Button(top, text="x", image=pixel, compound="center", height=btnHeight, width=btnWidth, command="")
 	#if savedRun: xbutton["state"] = tk.DISABLED
 	#xbutton.grid(column=2, row=4, sticky=tk.W, pady=3, padx=5)
 	#CreateToolTip(xbutton, "Placeholder.")
+	progressBar = tk.ttk.Progressbar(top, orient="horizontal", length=160, mode="determinate")
+	progressBar["maximum"] = 1
+	progressBar["value"] = 0
 
-	rebutton = tk.Button(top, text="Reorder", image=pixel, compound="center", height=btnHeight, width=btnWidth, command=saveOrder)
-	if savedRun: rebutton["state"] = tk.DISABLED
-	rebutton.grid(column=1, row=5, sticky=tk.W, pady=0)
-	CreateToolTip(rebutton, "Applies current order as displayed in the list.")
+	btnReorder = tk.Button(top, text="Reorder", image=pixel, compound="center", height=btnHeight, width=btnWidth, command=saveOrder)
+	if savedRun: btnReorder["state"] = tk.DISABLED
+	btnReorder.grid(column=1, row=5, sticky=tk.W, pady=0)
+	CreateToolTip(btnReorder, "Applies current order as displayed in the list.")
 
-	cpbutton = tk.Button(top, text="Copy to Acq", image=pixel, compound="center", height=btnHeight, width=btnWidth, command=copyAcq)
-	if savedRun or "size" not in settings.keys(): cpbutton["state"] = tk.DISABLED
-	cpbutton.grid(column=2, row=5, sticky=tk.W, pady=0, padx=5)
-	CreateToolTip(cpbutton, "Applies tgt pattern to all navigator points marked as Acquire.")
+	btnCopyToAcq = tk.Button(top, text="Copy to Acq", image=pixel, compound="center", height=btnHeight, width=btnWidth, command=copyAcq)
+	if savedRun or "size" not in settings.keys(): btnCopyToAcq["state"] = tk.DISABLED
+	btnCopyToAcq.grid(column=2, row=5, sticky=tk.W, pady=0, padx=5)
+	CreateToolTip(btnCopyToAcq, "Applies tgt pattern to all navigator points marked as Acquire.")
 
-	sbutton = tk.Button(top, text="Save", image=pixel, compound="center", height=btnHeight, width=btnWidth, command=saveFile)
-	sbutton.grid(column=1, row=6, sticky=tk.SW, pady=3)
-	CreateToolTip(sbutton, "Saves all changes to the tgts file.")
+	btnSave = tk.Button(top, text="Save", image=pixel, compound="center", height=btnHeight, width=btnWidth, command=saveFile)
+	btnSave.grid(column=1, row=6, sticky=tk.SW, pady=3)
+	CreateToolTip(btnSave, "Saves all changes to the tgts file.")
 
-	rbutton = tk.Button(top, text="Reset", image=pixel, compound="center", height=btnHeight, width=btnWidth, command=resetOrder)
-	rbutton.grid(column=2, row=6, sticky=tk.SW, pady=3, padx=5)
-	CreateToolTip(rbutton, "Resets changes made since window was opened.")
+	btnReset = tk.Button(top, text="Reset", image=pixel, compound="center", height=btnHeight, width=btnWidth, command=resetOrder)
+	btnReset.grid(column=2, row=6, sticky=tk.SW, pady=3, padx=5)
+	CreateToolTip(btnReset, "Resets changes made since window was opened.")
 	  
 	# create settings area
-	labelSet = tk.Label(top, text="Settings (optional)")
-	labelSet.grid(column=3, columnspan=5, row=0, )
+	labelSettings = tk.Label(top, text="Settings (optional)")
+	labelSettings.grid(column=3, columnspan=5, row=0, )
 
 	labelTilt = tk.Label(top, text = "Tilt angles [deg]")
 	labelTilt.grid(column=3, row=2, sticky=tk.NE)
@@ -899,32 +1092,32 @@ def gui(targetFile):
 	entryStep.grid(column=7, row=2, sticky=tk.NW)
 
 	labelPretilt = tk.Label(top, text = "Pretilt [deg]")
-	labelPretilt.grid(column=3, row=4, sticky=tk.NE)
+	labelPretilt.grid(column=3, row=3, sticky=tk.NE)
 
 	ecPretilt = tk.StringVar(top, settings["pretilt"] if "pretilt" in settings.keys() else "")
 	ecPretilt.trace_add("write", readEntry)
 	entryPretilt = tk.Entry(top, textvariable=ecPretilt, width=20)
 	if savedRun: entryPretilt["state"] = tk.DISABLED
-	entryPretilt.grid(column=4, columnspan=4, row=4, sticky=tk.NW)
+	entryPretilt.grid(column=4, columnspan=4, row=3, sticky=tk.NW)
 
 	labelRotation = tk.Label(top, text = "Rotation [deg]")
-	labelRotation.grid(column=3, row=5, sticky=tk.NE)
+	labelRotation.grid(column=3, row=4, sticky=tk.NE)
 
 	ecRotation = tk.StringVar(top, settings["rotation"] if "rotation" in settings.keys() else "")
 	ecRotation.trace_add("write", readEntry)
 	entryRotation = tk.Entry(top, textvariable=ecRotation, width=20)
 	if savedRun: entryRotation["state"] = tk.DISABLED
-	entryRotation.grid(column=4, columnspan=4, row=5, sticky=tk.NW)
+	entryRotation.grid(column=4, columnspan=4, row=4, sticky=tk.NW)
 
 	# create geometry buttons
-	geombutton = tk.Button(top, text="Measure Geometry", image=pixel, compound="center", height=btnHeight, command=measureGeo)
-	if savedRun: geombutton["state"] = tk.DISABLED
-	geombutton.grid(column=3, row=6, sticky=tk.SE, pady=3, padx=5)
-	CreateToolTip(geombutton, "\n".join(["Runs routine to measure pretilt and rotation.", "This will cause exposures on the chosen geometry points."]))
+	btnMeasureGeometry = tk.Button(top, text="Measure Geometry", image=pixel, compound="center", height=btnHeight, command=measureGeo)
+	if savedRun: btnMeasureGeometry["state"] = tk.DISABLED
+	btnMeasureGeometry.grid(column=3, row=5, sticky=tk.E, pady=3, padx=5)
+	CreateToolTip(btnMeasureGeometry, "\n".join(["Runs routine to measure pretilt and rotation.", "This will cause exposures on the chosen geometry points."]))
 
-	georbutton = tk.Button(top, text="Reset Geo Pts", image=pixel, compound="center", height=btnHeight, command=resetGeo)
-	georbutton.grid(column=4, columnspan=4, row=6, sticky=tk.SW, pady=3, padx=5)
-	CreateToolTip(georbutton, "Deletes all geometry points.")
+	btnResetGeoPts = tk.Button(top, text="Reset Geo Pts", image=pixel, compound="center", height=btnHeight, command=resetGeo)
+	btnResetGeoPts.grid(column=4, columnspan=4, row=5, sticky=tk.W, pady=3, padx=5)
+	CreateToolTip(btnResetGeoPts, "Deletes all geometry points.")
 
 	# create target plot
 	colors = ["#5689bf" if not val["skip"] else '#aaaaaa' for val in targets]
@@ -938,6 +1131,7 @@ def gui(targetFile):
 	canvas.get_tk_widget().grid(column=0, columnspan=8, row=7, padx=10, pady=10)				# placing the canvas on the Tkinter window
 	fig.canvas.mpl_connect('pick_event', onSelect)
 	fig.canvas.mpl_connect('button_press_event', onClick)
+	fig.canvas.mpl_connect('scroll_event', onScroll)
 
 	toolbar_frame = tk.Frame(top)										# creating the Matplotlib toolbar
 	toolbar = NavigationToolbar2Tk(canvas, toolbar_frame)
@@ -945,21 +1139,21 @@ def gui(targetFile):
 	toolbar_frame.grid(column=0, row=8, sticky=tk.W, padx=10)
 
 	# create axis buttons
-	beambutton = tk.Button(top, text="Toggle beam", image=pixel, compound="center", height=btnHeight, command=toggleBeam)
-	beambutton.grid(column=1, row=8, sticky=tk.W, pady=5, padx=5)
-	CreateToolTip(beambutton, "\n".join(["Toggles display of beam diameter.", "(Beam diameter is taken from IlluminatedArea or from value set in script.)"]))
+	btnToggleBeam = tk.Button(top, text="Toggle beam", image=pixel, compound="center", height=btnHeight, command=toggleBeam)
+	btnToggleBeam.grid(column=1, row=8, sticky=tk.W, pady=5, padx=5)
+	CreateToolTip(btnToggleBeam, "\n".join(["Toggles display of beam diameter.", "(Beam diameter is taken from IlluminatedArea or from value set in script.)"]))
 
-	swapbutton = tk.Button(top, text="Swap XY", image=pixel, compound="center", height=btnHeight, command=swapAxes)
-	swapbutton.grid(column=2, row=8, sticky=tk.E, pady=5, padx=5)
-	CreateToolTip(swapbutton, "Swaps axes of target plot.")
+	btnSwapXY = tk.Button(top, text="Swap XY", image=pixel, compound="center", height=btnHeight, command=swapAxes)
+	btnSwapXY.grid(column=2, row=8, sticky=tk.E, pady=5, padx=5)
+	CreateToolTip(btnSwapXY, "Swaps axes of target plot.")
 
-	invXbutton = tk.Button(top, text="Invert X", image=pixel, compound="center", height=btnHeight, command=invertX)
-	invXbutton.grid(column=3, row=8, sticky=tk.E, pady=5, padx=5)
-	CreateToolTip(invXbutton, "Inverts X axis of target plot.")
+	btnInvertX = tk.Button(top, text="Invert X", image=pixel, compound="center", height=btnHeight, command=invertX)
+	btnInvertX.grid(column=3, row=8, sticky=tk.E, pady=5, padx=5)
+	CreateToolTip(btnInvertX, "Inverts X axis of target plot.")
 
-	invYbutton = tk.Button(top, text="Invert Y", image=pixel, compound="center", height=btnHeight, command=invertY)
-	invYbutton.grid(column=4, columnspan=4, row=8, sticky=tk.W, pady=5, padx=5)
-	CreateToolTip(invYbutton, "Inverts Y axis of target plot.")
+	btnInvertY = tk.Button(top, text="Invert Y", image=pixel, compound="center", height=btnHeight, command=invertY)
+	btnInvertY.grid(column=4, columnspan=4, row=8, sticky=tk.W, pady=5, padx=5)
+	CreateToolTip(btnInvertY, "Inverts Y axis of target plot.")
 
 	def closeGUI():
 		if targets != targetsOrig:
@@ -977,13 +1171,17 @@ def gui(targetFile):
 
 sem.SuppressReports()
 sem.Pause("Please make sure that 'Move stage for big mouse shifts' is unchecked!")
+if int(sem.ReportAxisPosition("F")[0]) != 0 and sem.IsVariableDefined("warningFocusArea") == 0:
+	sem.Pause("WARNING: Position of Focus area is not 0! Please set it to 0 if you intend to use the Measure Geometry function!")
+	sem.SetPersistentVar("warningFocusArea", "")
 sem.UserSetDirectory("Please choose a directory for saving targets and tilt series!")
 
 imageShiftLimit = sem.ReportProperty("ImageShiftLimit")
 
 navSize = sem.ReportNumTableItems()
 if navSize > 0:
-	sem.ReportNavItem()												# check if selected nav item already has tgts file
+	navInfo = sem.ReportNavItem()
+	navID = int(navInfo[0])										# check if selected nav item already has tgts file
 	navNote = sem.GetVariable("navNote")
 else:
 	navNote = ""
@@ -1004,7 +1202,10 @@ if tf != []:
 	if editTgts == 1:
 		tgtsFilePath = tf[-1]
 
-polygons = []
+sem.GoToLowDoseArea("R")											# need SS to stage matrix for conversion
+ss2sMatrix = np.array(sem.SpecimenToStageMatrix(0)).reshape((2, 2))
+s2ssMatrix = np.array(sem.StageToSpecimenMatrix(0)).reshape((2, 2))
+beamPolygons = []
 beamR = beamDiameter / 2
 
 if editTgts == 0:
@@ -1013,32 +1214,43 @@ if editTgts == 0:
 	else:
 		groupInfo = [0, 0, 0]
 	pointRefine = 0
+	usePolygon = 0
 	if not targetPattern and not targetByShift and groupInfo[1] > 0:
-		pointRefine = sem.YesNoBox("\n".join(["GROUP OF POINTS?", "", "The selected navigator item is part of a group. Do you want to use the points of this group as initial target coordinates to be refined?"]))
+		pointRefine = sem.YesNoBox("\n".join(["GROUP OF POINTS?", "", "The selected navigator item is part of a group of " + str(groupInfo[2]) + "points. Do you want to use these points as initial target coordinates to be refined?"]))
 		if pointRefine == 1:
-			groupID = groupInfo[1]
-			groupPoints = groupInfo[2]
-			firstPoint = sem.ReportNavItem()
-			navLabel = sem.GetVariable("navLabel")
-			if guidance:
-				sem.Pause("Please make sure that the first point of the group is selected! (Selected point: " + navLabel + ", points in group: " + str(int(groupPoints)) + ")")
-			sem.Echo("NOTE: Selected point: " + navLabel + ", points in group: " + str(int(groupPoints)))
-			coordsRefine = []
-			coordsRefine.append([0, 0])
-			for i in range(int(firstPoint[0]) + 1, int(firstPoint[0] + groupPoints)):
-				point = sem.ReportOtherItem(i)
-				coordsRefine.append([-point[1] + firstPoint[1], -point[2] + firstPoint[2]])
+			groupID = int(groupInfo[1])
+			sem.GetNavGroupStageCoords(groupID, "groupStageX", "groupStageY", "groupStageZ")
+			groupStage = np.column_stack((np.array(sem.GetVariable("groupStageX").split(), dtype=float), np.array(sem.GetVariable("groupStageY").split(), dtype=float)))
+			groupStageZ = float(sem.GetVariable("groupStageZ").split()[0])
+			coordsRefine = np.array([s2ssMatrix @ x for x in groupStage - groupStage[0]])
+	elif targetPattern and not alignToP and navInfo[4] == 1:						# if targetPattern and nav item is polygon
+		usePolygon = sem.YesNoBox("\n".join(["POLYGON?", "", "The selected navigator item is a polygon. Do you want to fill it with a grid of points based on the beam diameter?"]))
+		if usePolygon == 1:
+			sem.SaveNavigator()									# parse nav file to get polygon coords
+			navFile = sem.ReportNavFile()
+			navHeader, navItems = parseNav(navFile)
+
+			vertices = np.vstack([navItems[navID - 1]["PtsX"], navItems[navID - 1]["PtsY"]]).transpose()
+			polygon = matplotlib.path.Path(vertices)
 
 	sem.EnterString("userName","Please provide a rootname for the PACE-tomo collection area!")
-	userName = sem.GetVariable("userName")
+	userName = sampleName + sem.GetVariable("userName")
 
 	tgtsFilePath = os.path.join(curDir, userName + "_tgts.txt")
+
+	# Make sure tgts file is unique
+	counter = 1
+	while os.path.exists(tgtsFilePath):
+		counter += 1
+		tgtsFilePath = os.path.join(curDir, userName + str(counter) + "_tgts.txt") 
+	if counter > 1:
+		userName = userName + str(counter)
 
 	# align center
 	sem.TiltTo(0)
 	sem.ResetImageShift()
 	if pointRefine == 1:
-		sem.MoveToNavItem(int(firstPoint[0]))
+		sem.MoveStageTo(*groupStage[0], groupStageZ)
 	elif alignToP:												# center hole for center of tgtPattern
 		sem.V()
 		sem.AlignTo("P")
@@ -1048,7 +1260,7 @@ if editTgts == 0:
 	targetNo = 0
 
 	userInput = 0
-	while userInput == 0 and not targetPattern:
+	while userInput == 0 and (not targetPattern or usePolygon == 1):	# Only collect Preview image for non-target pattern or polygon setups
 		if useSearch: 
 			sem.Search()
 		else:
@@ -1065,13 +1277,15 @@ if editTgts == 0:
 	stageX, stageY, stageZ = sem.ReportStageXYZ()
 	target["stageX"], target["stageY"] = sem.AdjustStagePosForNav(stageX, stageY, ISX0, ISY0)
 	target["SSX"], target["SSY"] = [0, 0]
+	target["viewfile"] = userName + "_tgt_001_view.mrc"
 
 	saveNewTarget(tgtsFilePath, targetNo, target)
 
-	if drawBeam:
+	if drawBeam or usePolygon == 1:
 		if beamR == 0:
 			beamR = sem.ReportIlluminatedArea() * 100 / 2
-		polygons.append(drawBeamPolygon(target["stageX"], target["stageY"], stageZ, beamR, maxTilt))
+		if drawBeam:
+			beamPolygons.append(drawBeamPolygon(target["stageX"], target["stageY"], stageZ, beamR, maxTilt))
 
 	# make view map tor realign to item
 	sem.SetCameraArea("V", "F")
@@ -1083,17 +1297,31 @@ if editTgts == 0:
 	sem.RestoreCameraSet("V")
 
 	if targetPattern:
-		if vecA == (0, 0):
-			sem.Echo("Please center the neighboring hole by dragging the image using the right mouse button and press the <b> key when finished!")
-			sem.OKBox("\n".join(["Please center the neighboring hole [2] by dragging the image using the right mouse button!","","Press the <b> key when finished!","","Hole pattern:","0 0 0","0 1 2 <=","0 0 0"]))
-			while not sem.KeyBreak():
-				sem.Delay(0.1)
-			sem.GoToLowDoseArea("R")
-			SSX, SSY = sem.ReportSpecimenShift()
-			SSX -= SSX0
-			SSY -= SSY0
-			vecA = (SSX, SSY)
-			vecB = (-vecA[1], vecA[0])
+		if np.linalg.norm(vecA) == 0 and usePolygon == 0:
+			holeDiameter = sem.EnterDefaultedNumber(1.2, 1, "Please enter the hole diameter in microns!")
+			foundVecs = False
+			if holeDiameter > 0:
+				foundVecs, vecA, vecB = vecByXcorr(holeDiameter)
+
+			if not foundVecs:
+				sem.Echo("Please center the neighboring hole by dragging the image using the right mouse button and press the <b> key when finished!")
+				sem.OKBox("\n".join(["Please center the neighboring hole [2] by dragging the image using the right mouse button!","","Press the <b> key when finished!","","Hole pattern:","0 0 0","0 1 2 <=","0 0 0"]))
+				while not sem.KeyBreak():
+					sem.Delay(0.1)
+				sem.GoToLowDoseArea("R")
+				SSX, SSY = sem.ReportSpecimenShift()
+				SSX -= SSX0
+				SSY -= SSY0
+				vecA = (SSX, SSY)
+				vecB = (-vecA[1], vecA[0])
+
+		if np.linalg.norm(vecA) == 0 and usePolygon == 1:
+			dist = [2 * beamR, 2 * beamR / np.cos(np.radians(maxTilt))]
+			theta = np.arctan(np.tan(np.radians(patternRot)) * np.cos(np.radians(maxTilt)))
+			rotM = np.array([[np.cos(theta), -np.sin(theta)], [np.sin(theta), np.cos(theta)]])
+			size = 10
+			vecA = (rotM @ np.array([1, 0])) * dist
+			vecB = (rotM @ np.array([0, 1])) * dist
 
 		if alignToP:											# refine grid vectors by aligning to hole reference in P
 			sem.SetImageShift(ISX0, ISY0)								# reset IS to central hole after dragging
@@ -1136,28 +1364,38 @@ if editTgts == 0:
 			sem.Echo("Refined vector B: " + str(vecB))
 
 		output = ""
+		if usePolygon != 1:
+			output += "_set size = " + str(size) + "\n"
 		output += "_set vecA0 = " + str(vecA[0]) + "\n"
 		output += "_set vecA1 = " + str(vecA[1]) + "\n"
 		output += "_set vecB0 = " + str(vecB[0]) + "\n"
-		output += "_set vecB1 = " + str(vecB[1]) + "\n"
-		output += "_set size = " + str(size) + 2 * "\n"
+		output += "_set vecB1 = " + str(vecB[1]) + 2 * "\n"
+
 
 		for i in range(-size,size+1):
 			for j in range(-size,size+1):
 				if i == j == 0: continue
 
-				targetNo += 1
-
 				SSX = i * vecA[0] + j * vecB[0]
 				SSY = i * vecA[1] + j * vecB[1]
+
+				stageShift = ss2sMatrix @ np.array([SSX, SSY])
+
+				if usePolygon == 1 and not polygon.contains_points([(target["stageX"] + stageShift[0], target["stageY"] + stageShift[1])])[0]:
+					continue
+
+				targetNo += 1
 
 				output += "_tgt = " + str(targetNo).zfill(3) + "\n"
 				output += "tsfile = " + userName + "_ts_" + str(targetNo).zfill(3) + ".mrc" + "\n"
 				output += "SSX = " + str(SSX) + "\n"
 				output += "SSY = " + str(SSY) + "\n"
+				output += "stageX = " + str(target["stageX"] + stageShift[0]) + "\n"
+				output += "stageY = " + str(target["stageY"] + stageShift[1]) + "\n"
 				output += "skip = False" + 2 * "\n"
 
-				ptIndex = int(sem.AddStagePosAsNavPoint(target["stageX"] - SSX, target["stageY"] - SSY, stageZ))
+				ptIndex = int(sem.AddStagePosAsNavPoint(target["stageX"] + stageShift[0], target["stageY"] + stageShift[1], stageZ))
+				#ptIndex = int(sem.AddStagePosAsNavPoint(target["stageX"] + ss2sMatrix[0, 0] * SSX + ss2sMatrix[0, 1] * SSY, target["stageY"] + ss2sMatrix[1, 0] * SSX + ss2sMatrix[1, 1] * SSY, stageZ))
 				sem.ChangeItemLabel(ptIndex, str(targetNo).zfill(3))
 
 				sem.Echo("Target " + str(targetNo).zfill(3) + " (" + userName + "_tgt_" + str(targetNo).zfill(3) + ".mrc) with image shifts " + str(SSX) + ", " + str(SSY) + " was added.")
@@ -1178,9 +1416,9 @@ while reopen:
 	gui(tgtsFilePath)											# open GUI after selection is done
 
 sem.SetImageShift(0,0)
-if len(polygons) > 0:
-	polygons.reverse()
-	for polyID in polygons:											# needs to be reversed to keep IDs consistent during deletion
+if len(beamPolygons) > 0:
+	beamPolygons.reverse()
+	for polyID in beamPolygons:											# needs to be reversed to keep IDs consistent during deletion
 		sem.DeleteNavigatorItem(polyID)
 
 sem.Echo("Target selection completed! " + str(targetNo) + " targets were selected.")
