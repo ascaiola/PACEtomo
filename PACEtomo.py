@@ -284,8 +284,8 @@ sem.UpdateItemZ()
 if alignToP:
 	sem.V()
 	sem.AlignTo("P")
-else:
-	sem.RealignToNavItem(1)
+#else:
+#	sem.RealignToNavItem(1)
 
 sem.Echo("Tilting to start tilt angle...")
 #backlash correction
