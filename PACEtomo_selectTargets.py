@@ -1027,7 +1027,7 @@ if editTgts == 0:
 			coordsRefine.append([0, 0])
 			for i in range(int(firstPoint[0]) + 1, int(firstPoint[0] + groupPoints)):
 				point = sem.ReportOtherItem(i)
-				coordsRefine.append([-point[1] + firstPoint[1], -point[2] + firstPoint[2]])
+				coordsRefine.append([-point[1] + firstPoint[1], point[2] - firstPoint[2]])
 
 	sem.EnterString("userName","Please provide a rootname for the PACE-tomo collection area!")
 	userName = sem.GetVariable("userName")
