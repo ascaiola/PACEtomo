@@ -725,6 +725,7 @@ if not recover:
 							targets[targetNo]["SSY"] = str(SSY)
 					sem.Echo("Target pattern was overwritten using refined vectors.")
 			sem.SetImageShift(ISX0, ISY0)							# reset IS to center position
+	#left in, but maybe show be removed ? to test
 	else:
 		sem.RealignToOtherItem(navID, 1)
 
