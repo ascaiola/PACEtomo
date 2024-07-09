@@ -1081,7 +1081,7 @@ if not recover:
         positionFocus += stepDefocus                                # adds defocus step between targets and resets to initial defocus if minDefocus is surpassed
         if positionFocus > minFocus0: positionFocus = focus0
     if continousDefocus : 
-        sem.SetPersistentVar('LASTPACEDEFOCUS',positionFocus) #save last assign value
+        sem.SetPersistentVar('LASTPACEDEFOCUS',str(positionFocus)) #save last assign value
 
 ### Start tilt
     log("Start tilt series...", style=1)
