@@ -20,6 +20,7 @@ groupSize       = 2         # group size for grouped dose-symmetric scheme (numb
 minDefocus      = -5        # minimum defocus [microns] of target range (low defocus)
 maxDefocus      = -5        # maximum defocus [microns] of target range (high defocus)
 stepDefocus     = 0.5       # step [microns] between target defoci (between TS)
+continousDefocus = True      # Allow to continue defocus between different execution of the PACEtomo script (e.g. if doing multiple areas at once)
 
 focusSlope      = 0.0       # [DEPRECATED] empirical linear focus correction [microns per degree] (obtained by linear regression of CTF fitted defoci over tilt series; microscope stage dependent)
 delayIS         = 0.5       # delay [s] between applying image shift and Record
@@ -984,7 +985,15 @@ if not recover:
     SSX0, SSY0 = sem.ReportSpecimenShift()
 
     sem.G()
-    focus0 = float(sem.ReportDefocus())
+    if continousDefocus:
+        try :
+            focus0 = float(sem.GetVariable('LASTPACEDEFOCUS'))
+            if focus0 == 0 : #What happens if fails ?
+                focus0 = float(sem.ReportDefocus())
+        except :
+            focus0 = float(sem.ReportDefocus()) #Note Alain : ask Fabian why that and not maxDefocus ? Risk of wrong defocus estimation ?
+    else :
+        focus0 = float(sem.ReportDefocus())
     positionFocus = focus0                                         # set maxDefocus as focus0 and add focus steps in loop
     minFocus0 = focus0 - maxDefocus + minDefocus
 
@@ -1071,6 +1080,8 @@ if not recover:
 
         positionFocus += stepDefocus                                # adds defocus step between targets and resets to initial defocus if minDefocus is surpassed
         if positionFocus > minFocus0: positionFocus = focus0
+    if continousDefocus : 
+        sem.SetPersistentVar('LASTPACEDEFOCUS',positionFocus) #save last assign value
 
 ### Start tilt
     log("Start tilt series...", style=1)
