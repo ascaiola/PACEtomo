@@ -6,9 +6,9 @@
 #               More information at http://github.com/eisfabian/PACEtomo
 # Author:       Fabian Eisenstein
 # Created:      2021/04/16
-# Revision:     v1.8.2
+# Revision:     v1.8.2a1
 # Last Change:  2024/06/07: fixed crash when getting frame path from non-frame saving cameras
-# Last Change:  2024/07/10: add support for changing continuously the defocus through different execution of the PACEtomo script
+# Last Change:  2024/07/10: add support for changing continuously the defocus through different execution of the PACEtomo script to prevent over-representation of high defocuses in tilt series
 # ===================================================================
 
 ############ SETTINGS ############ 
@@ -93,7 +93,7 @@ import numpy as np
 from scipy import optimize
 if sortByTilt: import mrcfile
 
-versionPACE = "1.8.1"
+versionPACE = "1.8.2b1"
 versionCheck = sem.IsVersionAtLeast("40100", "20231001")
 if not versionCheck and sem.IsVariableDefined("warningVersion") == 0:
     runScript = sem.YesNoBox("\n".join(["WARNING: You are using a version of SerialEM that does not support all PACEtomo features. It is recommended to update to the latest SerialEM beta version!", "", "Do you want to run PACEtomo regardless?"]))
@@ -990,6 +990,8 @@ if not recover:
         try :
             focus0 = float(sem.GetVariable('LASTPACEDEFOCUS'))
             if focus0 == 0 : #What happens if fails ?
+                focus0 = float(sem.ReportDefocus())
+            if focus0 < maxDefocus or focus0 > minDefocus : #reset if limits of the defocus ranges are changed and now outside
                 focus0 = float(sem.ReportDefocus())
         except :
             focus0 = float(sem.ReportDefocus()) #Note Alain : ask Fabian why that and not maxDefocus ? Risk of wrong defocus estimation ?
