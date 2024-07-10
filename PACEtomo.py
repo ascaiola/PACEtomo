@@ -6,8 +6,9 @@
 #               More information at http://github.com/eisfabian/PACEtomo
 # Author:       Fabian Eisenstein
 # Created:      2021/04/16
-# Revision:     v1.8.1
+# Revision:     v1.8.2
 # Last Change:  2024/06/07: fixed crash when getting frame path from non-frame saving cameras
+# Last Change:  2024/07/10: add support for changing continuously the defocus through different execution of the PACEtomo script
 # ===================================================================
 
 ############ SETTINGS ############ 
@@ -20,7 +21,6 @@ groupSize       = 2         # group size for grouped dose-symmetric scheme (numb
 minDefocus      = -5        # minimum defocus [microns] of target range (low defocus)
 maxDefocus      = -5        # maximum defocus [microns] of target range (high defocus)
 stepDefocus     = 0.5       # step [microns] between target defoci (between TS)
-continousDefocus = True      # Allow to continue defocus between different execution of the PACEtomo script (e.g. if doing multiple areas at once)
 
 focusSlope      = 0.0       # [DEPRECATED] empirical linear focus correction [microns per degree] (obtained by linear regression of CTF fitted defoci over tilt series; microscope stage dependent)
 delayIS         = 0.5       # delay [s] between applying image shift and Record
@@ -73,6 +73,7 @@ cryoARM         = False     # if you use a JEOL cryoARM TEM, this will keep the 
 coldFEG         = False     # if you use a cold FEG, this will flash the gun whenever the dewars are being refilled
 flashInterval   = -1        # time in hours between cold FEG flashes, -1: flash only during dewar refill (interval is ignored on Krios, uses FlashingAdvised function instead)
 slitInterval    = 0         # time in minutes between centering the energy filder slit using RefineZLP, ONLY works with tgtPattern (needs pattern vectors to find good position for alignment)
+continousDefocus = True     # Allow to continue through the defocus list between different execution of the PACEtomo script (e.g. if doing multiple areas with small number of targets each). Helps to prevent having too many high defocus tilt series
 
 # Target montage settings
 tgtMontage      = False     # collect montage for each target using the shorter camera length (e.g. for square aperture montage tomography)
