@@ -986,14 +986,11 @@ if not recover:
     SSX0, SSY0 = sem.ReportSpecimenShift()
 
     sem.G()
-    if continousDefocus:
-        try :
-            focus0 = float(sem.GetVariable('LASTPACEDEFOCUS'))
-            if focus0 == 0 : #What happens if fails ?
-                focus0 = float(sem.ReportDefocus())
-            if focus0 < maxDefocus or focus0 > minDefocus : #reset if limits of the defocus ranges are changed and now outside
-                focus0 = float(sem.ReportDefocus())
-        except :
+    if continousDefocus and sem.IsVariableDefined('LASTPACEDEFOCUS') :
+        focus0 = float(sem.GetVariable('LASTPACEDEFOCUS'))
+        if focus0 == 0 : #What happens if fails ?
+            focus0 = float(sem.ReportDefocus())
+        if focus0 < maxDefocus or focus0 > minDefocus : #reset if limits of the defocus ranges are changed and now outside
             focus0 = float(sem.ReportDefocus()) #Note Alain : ask Fabian why that and not maxDefocus ? Risk of wrong defocus estimation ?
     else :
         focus0 = float(sem.ReportDefocus())
